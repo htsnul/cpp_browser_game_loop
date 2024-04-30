@@ -1,13 +1,11 @@
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <iomanip>
 #include <optional>
 #include <string>
 #include <sstream>
-#include <thread>
 #include <vector>
 
 #include <netinet/in.h>
@@ -15,24 +13,26 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-using namespace std::chrono_literals;
 using namespace std::string_literals;
 
 const auto baseHTML = R"(
 <!DOCTYPE html>
 <canvas width="256" height="256"></canvas>
 <script>
-  const keys = Array(256).fill(0);
+  const keys = new Uint8Array(256);
   onkeydown = (e) => keys[e.keyCode] = 1;
   onkeyup = (e) => keys[e.keyCode] = 0;
   onload = async () => {
     while (true) {
-      const res = await fetch("/", { method: "POST", body: keys.join("") });
-      const json = await res.json();
+      const res = await fetch("/", { method: "POST", body: keys });
+      const arrayBuffer = await res.arrayBuffer();
       const canvas = document.querySelector("canvas");
       const ctx = canvas.getContext("2d");
-      const imageData = new ImageData(new Uint8ClampedArray(json), 256);
-      ctx.putImageData(imageData, 0, 0);
+      const imageData = new ImageData(new Uint8ClampedArray(arrayBuffer), 256);
+      await new Promise((resolve) => requestAnimationFrame(() => {
+        ctx.putImageData(imageData, 0, 0);
+        resolve();
+      }));
     }
   };
 </script>
@@ -46,7 +46,7 @@ enum class KeyCode {
 };
 
 bool isKeyDown(std::string_view requestBody, KeyCode keyCode) {
-  return requestBody[int(keyCode)] == '1';
+  return requestBody[int(keyCode)];
 }
 
 struct Color {
@@ -82,14 +82,6 @@ struct Canvas {
   void clear() {
     drawRect(0, 0, WIDTH, HEIGHT, Color{0, 0, 0});
   }
-  std::string toString() {
-    std::string str;
-    for (int i = 0; i < data.size(); ++i) {
-      str += std::to_string(data[i]);
-      if (i != data.size() - 1) str += ",";
-    }
-    return "[" + str + "]";
-  }
   std::vector<uint8_t> data;
 };
 
@@ -97,7 +89,7 @@ Canvas canvas;
 
 struct Hero {
   void update(std::string_view requestBody) {
-    const float spd = 8.0f;
+    const float spd = 2.0f;
     if (isKeyDown(requestBody, KeyCode::ArrowLeft)) x_ -= spd;
     if (isKeyDown(requestBody, KeyCode::ArrowUp)) y_ -= spd;
     if (isKeyDown(requestBody, KeyCode::ArrowRight)) x_ += spd;
@@ -113,11 +105,10 @@ struct Hero {
 
 Hero hero;
 
-std::string update(std::string requestBody) {
+void update(std::string requestBody) {
   hero.update(requestBody);
   canvas.clear();
   hero.draw();
-  return canvas.toString();
 }
 
 std::string getRequestLine(std::string_view request) {
@@ -136,7 +127,13 @@ std::string createResponseBody(std::string_view request) {
   }
   if (requestLine.find("POST / ") == 0) {
     const auto requestBody = getRequestBody(request);
-    return update(requestBody);
+    update(requestBody);
+    std::string str;
+    std::copy(
+      canvas.data.begin(), canvas.data.end(),
+      std::back_inserter(str)
+    );
+    return str;
   }
   return {};
 }
@@ -185,7 +182,6 @@ int createSocketFileDescriptor() {
 }
 
 void runReceiveSendLoop(int acceptedFd) {
-  auto nextSendTimePoint = std::chrono::steady_clock::now();
   while(1) {
     const size_t RECV_BUF_SIZE{4096};
     std::vector<char> buf(RECV_BUF_SIZE);
@@ -201,9 +197,7 @@ void runReceiveSendLoop(int acceptedFd) {
     }
     std::string request = std::string(buf.data(), readSize);
     const auto response = createResponse(request);
-    std::this_thread::sleep_until(nextSendTimePoint);
     send(acceptedFd, response.c_str(), response.size(), 0);
-    nextSendTimePoint += 100ms;
   }
 }
 

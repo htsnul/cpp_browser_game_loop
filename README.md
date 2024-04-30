@@ -32,8 +32,7 @@ Linuxの素のC++だけでできることを考えたい。
 しかしHTTP/1.1であっても、Keep-Aliveと言う機構がある。
 これは、一度接続すると後続の送受信で同じ接続が使いまわせるようになっている。
 
-接続を使いまわす実装で確認したところ、60FPSが実現できる程度の速度は少なくとも手元では出るようだった。
-（ただし、本記事では実装のシンプルさのためFPSは低くしている）
+本記事の実装で、60FPSが実現できる程度の速度は少なくとも手元では出るようだった。
 
 ## コード
 
@@ -129,24 +128,13 @@ void runReceiveSendLoop(int acceptedFd) {
     }
     std::string request = std::string(buf.data(), readSize);
     const auto response = createResponse(request);
-    std::this_thread::sleep_until(nextSendTimePoint);
     send(acceptedFd, response.c_str(), response.size(), 0);
-    nextSendTimePoint += 100ms;
   }
 }
 ```
 
 `recv` で受信待ちをして、受信できたら応答を生成して `send` で送信する。
 先述したようにKeep-Aliveにより、基本は接続が維持されるのでこのループが回り続ける。
-
-```c++
-    std::this_thread::sleep_until(nextSendTimePoint);
-    send(acceptedFd, response.c_str(), response.size(), 0);
-    nextSendTimePoint += 100ms;
-```
-
-により、前回の応答送信から100ms待ってから送信する。つまり10FPSになる。
-先述したように60FPS程度まで上げれそうなのだが分かりやすさのため抑えている。
 
 ブラウザ側でページを閉じるなどで、接続が切れる場合がある。
 これは `readSize == 0` で検出できるので、
@@ -171,7 +159,13 @@ std::string createResponseBody(std::string_view request) {
   }
   if (requestLine.find("POST / ") == 0) {
     const auto requestBody = getRequestBody(request);
-    return update(requestBody);
+    update(requestBody);
+    std::string str;
+    std::copy(
+      canvas.data.begin(), canvas.data.end(),
+      std::back_inserter(str)
+    );
+    return str;
   }
   return {};
 }
@@ -192,7 +186,7 @@ std::string createResponse(std::string_view request) {
 
 GET要求が来たら、基本となるHTML `baseHTML` を応答とする。
 このHTML（内容は後述）からPOST要求が来るので、そのときは、
-`update` を呼び、生成した画像を応答とする。
+`update` を呼び、生成した画像のバイナリを文字列としてコピーして返却する。
 
 ## 基本となるHTML
 
@@ -201,17 +195,20 @@ const auto baseHTML = R"(
 <!DOCTYPE html>
 <canvas width="256" height="256"></canvas>
 <script>
-  const keys = Array(256).fill(0);
+  const keys = new Uint8Array(256);
   onkeydown = (e) => keys[e.keyCode] = 1;
   onkeyup = (e) => keys[e.keyCode] = 0;
   onload = async () => {
     while (true) {
-      const res = await fetch("/", { method: "POST", body: keys.join("") });
-      const json = await res.json();
+      const res = await fetch("/", { method: "POST", body: keys });
+      const arrayBuffer = await res.arrayBuffer();
       const canvas = document.querySelector("canvas");
       const ctx = canvas.getContext("2d");
-      const imageData = new ImageData(new Uint8ClampedArray(json), 256);
-      ctx.putImageData(imageData, 0, 0);
+      const imageData = new ImageData(new Uint8ClampedArray(arrayBuffer), 256);
+      await new Promise((resolve) => requestAnimationFrame(() => {
+        ctx.putImageData(imageData, 0, 0);
+        resolve();
+      }));
     }
   };
 </script>
@@ -224,11 +221,22 @@ const auto baseHTML = R"(
 `fetch` の応答をそのまま `ImageData` として、`canvas` に設定している。
 これにより、C++側で生成した画像が表示される。
 
+ただし、
+
+```
+      await new Promise((resolve) => requestAnimationFrame(() => {
+        ctx.putImageData(imageData, 0, 0);
+        resolve();
+      }));
+```
+
+により、垂直同期を待機し画像更新するようにしている。
+
 これがループで実行される。
 
 ## キー入力の取得
 
-要求の `body` にそのままキー情報が `0`、`1` の256文字が入っているので、
+要求の `body` にそのままキー情報が `0`、`1` のバイナリで入っているので、
 
 ```c++
 enum class KeyCode {
@@ -239,7 +247,7 @@ enum class KeyCode {
 };
 
 bool isKeyDown(std::string_view requestBody, KeyCode keyCode) {
-  return requestBody[int(keyCode)] == '1';
+  return requestBody[int(keyCode)];
 }
 ```
 
@@ -253,7 +261,7 @@ bool isKeyDown(std::string_view requestBody, KeyCode keyCode) {
 
 ## 画像の出力
 
-HTMLのcanvasにそのまま設定できるJSONを返したい。
+HTMLのcanvasにそのまま設定できるバイナリを返したい。
 
 ```c++
 struct Color {
@@ -289,19 +297,11 @@ struct Canvas {
   void clear() {
     drawRect(0, 0, WIDTH, HEIGHT, Color{0, 0, 0});
   }
-  std::string toString() {
-    std::string str;
-    for (int i = 0; i < data.size(); ++i) {
-      str += std::to_string(data[i]);
-      if (i != data.size() - 1) str += ",";
-    }
-    return "[" + str + "]";
-  }
   std::vector<uint8_t> data;
 };
 ```
 
-これで `toString()` したものを応答の `body` として返せばよい。
+先述のように、`data()` をそのまま文字列にコピーして返せばよい。
 
 ## 更新関数
 
@@ -326,19 +326,14 @@ struct Hero {
 
 Hero hero;
 
-std::string update(std::string requestBody) {
+void update(std::string requestBody) {
   hero.update(requestBody);
   canvas.clear();
   hero.draw();
-  return canvas.toString();
 }
 ```
 
 で、入力情報を使って更新描画を行い、結果を返すことができる。
-
-## 課題
-
-一定時間で接続が切れることで再接続によりプチフリーズが発生する？
 
 ## まとめ
 
